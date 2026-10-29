@@ -1,0 +1,4 @@
+.idea
+rootfs
+alpine-minirootfs-3.24.0-aarch64.tar
+docs/plan.md

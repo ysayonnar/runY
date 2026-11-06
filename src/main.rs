@@ -3,6 +3,7 @@ use nix::mount::{MsFlags, mount, umount};
 use nix::sched::{CloneFlags, unshare};
 use nix::unistd::sethostname;
 use std::{eprintln, format, io, os::unix::process::ExitStatusExt};
+use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
@@ -17,8 +18,8 @@ enum Commands {
         #[arg(last = true, required = true)]
         command: Vec<String>,
 
-        #[arg(long, required = true)]
-        hostname: String,
+        #[arg(long)]
+        hostname: Option<String>,
     },
 
     #[command(name = "__bootstrap", hide = true)]
@@ -31,7 +32,8 @@ enum Commands {
     },
 }
 
-fn handle_run(command: Vec<String>, hostname: String) -> io::Result<i32> {
+fn handle_run(command: Vec<String>, hostname: Option<String>) -> io::Result<i32> {
+    let hostname = hostname.unwrap_or_else(|| Uuid::new_v4().to_string());
     let executable = std::env::current_exe()?;
 
     let status = std::process::Command::new(executable)

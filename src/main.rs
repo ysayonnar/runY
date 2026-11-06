@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
+use nix::mount::{MsFlags, mount, umount};
 use nix::sched::{CloneFlags, unshare};
 use nix::unistd::sethostname;
-use std::os::unix::process::CommandExt;
 use std::{eprintln, format, io, os::unix::process::ExitStatusExt};
 
 #[derive(Debug, Parser)]
@@ -29,23 +29,6 @@ enum Commands {
         #[arg(long, required = true)]
         hostname: String,
     },
-}
-
-fn main() {
-    let cli = Args::parse();
-
-    let result = match cli.command {
-        Commands::Run { command, hostname } => handle_run(command, hostname),
-        Commands::Bootstrap { command, hostname } => handle_bootstrap(command, hostname),
-    };
-
-    match result {
-        Ok(exit_code) => std::process::exit(exit_code),
-        Err(why) => {
-            eprintln!("error occured: {why}");
-            std::process::exit(1)
-        }
-    }
 }
 
 fn handle_run(command: Vec<String>, hostname: String) -> io::Result<i32> {
@@ -78,16 +61,73 @@ fn handle_bootstrap(command: Vec<String>, hostname: String) -> io::Result<i32> {
     let mut cmd = std::process::Command::new(exec);
     cmd.args(&command[1..]);
 
-    unshare(CloneFlags::CLONE_NEWUTS)
+    unshare(CloneFlags::CLONE_NEWUTS | CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNS)
         .map_err(|errno| io::Error::other(format!("create UTS namespace: {}", errno as i32)))?;
 
-    sethostname(&hostname)
+    sethostname(hostname)
         .map_err(|errno| io::Error::other(format!("set hostname: {}", errno as i32)))?;
 
-    let error = cmd.exec();
+    make_mounts()?;
 
-    Err(io::Error::new(
-        error.kind(),
-        format!("failed to execute {}: {}", exec, error),
-    ))
+    let command_result = cmd.status();
+    let cleanup_result =
+        umount("/mnt/runy-test").map_err(|e| io::Error::other(format!("unmount test tmpfs: {e}")));
+
+    let status = match command_result {
+        Ok(status) => {
+            cleanup_result?;
+            status
+        }
+        Err(e) => {
+            if let Err(cleanup_error) = cleanup_result {
+                eprintln!("cleanup failed: {cleanup_error}");
+            }
+            return Err(io::Error::new(e.kind(), format!("failed to run: {e}")));
+        }
+    };
+
+    let exit_code = status
+        .code()
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
+
+    Ok(exit_code)
+}
+
+fn make_mounts() -> io::Result<()> {
+    mount(
+        None::<&str>,
+        "/",
+        None::<&str>,
+        MsFlags::MS_PRIVATE | MsFlags::MS_REC,
+        None::<&str>,
+    )
+    .map_err(|e| io::Error::other(format!("make mounts securely private: {e}")))?;
+
+    mount(
+        Some("tmpfs"),
+        "/mnt/runy-test",
+        Some("tmpfs"),
+        MsFlags::empty(),
+        Some("size=16m"),
+    )
+    .map_err(|e| io::Error::other(format!("mount test tmpfs: {e}")))?;
+
+    Ok(())
+}
+
+fn main() {
+    let cli = Args::parse();
+
+    let result = match cli.command {
+        Commands::Run { command, hostname } => handle_run(command, hostname),
+        Commands::Bootstrap { command, hostname } => handle_bootstrap(command, hostname),
+    };
+
+    match result {
+        Ok(exit_code) => std::process::exit(exit_code),
+        Err(why) => {
+            eprintln!("error occured: {why}");
+            std::process::exit(1)
+        }
+    }
 }

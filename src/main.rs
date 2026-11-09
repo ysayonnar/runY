@@ -1,7 +1,9 @@
 use clap::{Parser, Subcommand};
-use nix::mount::{MsFlags, mount, umount};
+use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::sched::{CloneFlags, unshare};
-use nix::unistd::sethostname;
+use nix::unistd::{chdir, pivot_root, sethostname};
+use std::fs::{self, remove_dir};
+use std::path::Path;
 use std::{eprintln, format, io, os::unix::process::ExitStatusExt};
 use uuid::Uuid;
 
@@ -20,6 +22,9 @@ enum Commands {
 
         #[arg(long)]
         hostname: Option<String>,
+
+        #[arg(long, short, required = true)]
+        rootfs: String,
     },
 
     #[command(name = "__bootstrap", hide = true)]
@@ -29,10 +34,13 @@ enum Commands {
 
         #[arg(long, required = true)]
         hostname: String,
+
+        #[arg(long, short, required = true)]
+        rootfs: String,
     },
 }
 
-fn handle_run(command: Vec<String>, hostname: Option<String>) -> io::Result<i32> {
+fn handle_run(command: Vec<String>, hostname: Option<String>, rootfs: String) -> io::Result<i32> {
     let hostname = hostname.unwrap_or_else(|| Uuid::new_v4().to_string());
     let executable = std::env::current_exe()?;
 
@@ -40,6 +48,8 @@ fn handle_run(command: Vec<String>, hostname: Option<String>) -> io::Result<i32>
         .arg("__bootstrap")
         .arg("--hostname")
         .arg(hostname)
+        .arg("--rootfs")
+        .arg(rootfs)
         .arg("--")
         .args(command)
         .status()
@@ -52,13 +62,16 @@ fn handle_run(command: Vec<String>, hostname: Option<String>) -> io::Result<i32>
     Ok(exit_code)
 }
 
-fn handle_bootstrap(command: Vec<String>, hostname: String) -> io::Result<i32> {
+fn handle_bootstrap(command: Vec<String>, hostname: String, rootfs: &str) -> io::Result<i32> {
     let exec = command.first().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "expected executive, found nothing",
         )
     })?;
+
+    let rootfs = fs::canonicalize(rootfs)
+        .map_err(|e| io::Error::new(e.kind(), format!("failed to canonicalize: {e}")))?;
 
     let mut cmd = std::process::Command::new(exec);
     cmd.args(&command[1..]);
@@ -69,24 +82,11 @@ fn handle_bootstrap(command: Vec<String>, hostname: String) -> io::Result<i32> {
     sethostname(hostname)
         .map_err(|errno| io::Error::other(format!("set hostname: {}", errno as i32)))?;
 
-    make_mounts()?;
+    make_mounts(&rootfs)?;
 
-    let command_result = cmd.status();
-    let cleanup_result =
-        umount("/mnt/runy-test").map_err(|e| io::Error::other(format!("unmount test tmpfs: {e}")));
-
-    let status = match command_result {
-        Ok(status) => {
-            cleanup_result?;
-            status
-        }
-        Err(e) => {
-            if let Err(cleanup_error) = cleanup_result {
-                eprintln!("cleanup failed: {cleanup_error}");
-            }
-            return Err(io::Error::new(e.kind(), format!("failed to run: {e}")));
-        }
-    };
+    let status = cmd
+        .status()
+        .map_err(|e| io::Error::new(e.kind(), format!("failed to run: {e}")))?;
 
     let exit_code = status
         .code()
@@ -95,7 +95,7 @@ fn handle_bootstrap(command: Vec<String>, hostname: String) -> io::Result<i32> {
     Ok(exit_code)
 }
 
-fn make_mounts() -> io::Result<()> {
+fn make_mounts(rootfs: &Path) -> io::Result<()> {
     mount(
         None::<&str>,
         "/",
@@ -106,13 +106,28 @@ fn make_mounts() -> io::Result<()> {
     .map_err(|e| io::Error::other(format!("make mounts securely private: {e}")))?;
 
     mount(
-        Some("tmpfs"),
-        "/mnt/runy-test",
-        Some("tmpfs"),
-        MsFlags::empty(),
-        Some("size=16m"),
+        Some(rootfs.as_os_str()),
+        rootfs.as_os_str(),
+        None::<&str>,
+        MsFlags::MS_BIND,
+        None::<&str>,
     )
-    .map_err(|e| io::Error::other(format!("mount test tmpfs: {e}")))?;
+    .map_err(|e| io::Error::other(format!("mount --bind rootfs: {e}")))?;
+
+    let old_root = rootfs.join(".oldroot");
+    std::fs::create_dir(&old_root)
+        .map_err(|e| io::Error::new(e.kind(), format!("failed to create .oldroot dir: {e}")))?;
+
+    pivot_root(rootfs, &old_root)
+        .map_err(|e| io::Error::other(format!("failed to pivot_root: {e}")))?;
+
+    chdir("/").map_err(|e| io::Error::other(format!("failed to chdir: {e}")))?;
+
+    umount2("/.oldroot", MntFlags::MNT_DETACH)
+        .map_err(|e| io::Error::other(format!("failed to unmount2 .oldroot: {e}")))?;
+
+    remove_dir("/.oldroot")
+        .map_err(|e| io::Error::new(e.kind(), format!("falied to rmdir .oldroot: {e}")))?;
 
     Ok(())
 }
@@ -121,8 +136,16 @@ fn main() {
     let cli = Args::parse();
 
     let result = match cli.command {
-        Commands::Run { command, hostname } => handle_run(command, hostname),
-        Commands::Bootstrap { command, hostname } => handle_bootstrap(command, hostname),
+        Commands::Run {
+            command,
+            hostname,
+            rootfs,
+        } => handle_run(command, hostname, rootfs),
+        Commands::Bootstrap {
+            command,
+            hostname,
+            rootfs,
+        } => handle_bootstrap(command, hostname, &rootfs),
     };
 
     match result {

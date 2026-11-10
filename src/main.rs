@@ -40,7 +40,7 @@ enum Commands {
     },
 }
 
-fn handle_run(command: Vec<String>, hostname: Option<String>, rootfs: String) -> io::Result<i32> {
+fn handle_run(command: Vec<String>, hostname: Option<String>, rootfs: &str) -> io::Result<i32> {
     let hostname = hostname.unwrap_or_else(|| Uuid::new_v4().to_string());
     let executable = std::env::current_exe()?;
 
@@ -140,7 +140,7 @@ fn main() {
             command,
             hostname,
             rootfs,
-        } => handle_run(command, hostname, rootfs),
+        } => handle_run(command, hostname, &rootfs),
         Commands::Bootstrap {
             command,
             hostname,

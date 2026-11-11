@@ -55,14 +55,6 @@ To open a shell:
 sudo ./target/debug/runY run --rootfs ./rootfs -- /bin/sh
 ```
 
-With `just` installed, the equivalent shortcut is:
-
-```sh
-just runy run --rootfs ./rootfs -- /bin/sh
-```
-
-The shortcut does not rebuild the executable. Run `cargo build --locked` after changing the source.
-
 ## How it works
 
 The process chain is `run → __bootstrap → __container → exec(command)`.

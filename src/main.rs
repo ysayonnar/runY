@@ -17,8 +17,13 @@ fn main() {
             command,
             hostname,
             rootfs,
-        } => runtime::bootstrap(command, hostname, &rootfs),
-        cli::Commands::Container { command, rootfs } => runtime::container(command, &rootfs),
+            startup_fd,
+        } => runtime::bootstrap(command, hostname, &rootfs, startup_fd),
+        cli::Commands::Container {
+            command,
+            rootfs,
+            startup_fd,
+        } => runtime::container(command, &rootfs, startup_fd),
     };
 
     match result {

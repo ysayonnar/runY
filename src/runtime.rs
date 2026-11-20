@@ -1,9 +1,11 @@
+mod fd;
 mod rootfs;
 mod signal;
 
+use nix::fcntl::OFlag;
 use nix::sched::{CloneFlags, unshare};
-use nix::unistd::sethostname;
-use std::format;
+use nix::unistd::{pipe2, sethostname};
+use std::os::fd::AsRawFd;
 use std::{fs, io, path::Path};
 use uuid::Uuid;
 
@@ -15,19 +17,29 @@ pub(crate) fn run(
     let hostname = hostname.unwrap_or_else(|| Uuid::new_v4().to_string());
     let executable = std::env::current_exe()?;
 
+    let (startup_read, startup_write) = pipe2(OFlag::O_CLOEXEC).map_err(io::Error::other)?;
+    fd::close_cloexec(&startup_write)?;
+
     let mut cmd = std::process::Command::new(executable);
     cmd.arg("__bootstrap");
     cmd.arg("--hostname");
     cmd.arg(hostname);
     cmd.arg("--rootfs");
     cmd.arg(rootfs);
+    cmd.arg("--startup-fd");
+    cmd.arg(format!("{}", startup_write.as_raw_fd()));
     cmd.arg("--");
     cmd.args(command);
 
     signal::propagate_signals_to_child(cmd)
 }
 
-pub(crate) fn bootstrap(command: Vec<String>, hostname: String, rootfs: &Path) -> io::Result<i32> {
+pub(crate) fn bootstrap(
+    command: Vec<String>,
+    hostname: String,
+    rootfs: &Path,
+    startup_fd: i32,
+) -> io::Result<i32> {
     let rootfs = fs::canonicalize(rootfs)
         .map_err(|e| io::Error::new(e.kind(), format!("failed to canonicalize: {e}")))?;
 
@@ -45,13 +57,15 @@ pub(crate) fn bootstrap(command: Vec<String>, hostname: String, rootfs: &Path) -
     cmd.arg("__container");
     cmd.arg("--rootfs");
     cmd.arg(rootfs);
+    cmd.arg("--startup-fd");
+    cmd.arg(format!("{}", startup_fd.as_raw_fd()));
     cmd.arg("--");
     cmd.args(command);
 
     signal::propagate_signals_to_child(cmd)
 }
 
-pub(crate) fn container(command: Vec<String>, rootfs: &Path) -> io::Result<i32> {
+pub(crate) fn container(command: Vec<String>, rootfs: &Path, startup_fd: i32) -> io::Result<i32> {
     let entrypoint = command.first().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -65,14 +79,7 @@ pub(crate) fn container(command: Vec<String>, rootfs: &Path) -> io::Result<i32> 
     rootfs::switch_root(rootfs)?;
     rootfs::mount_proc()?;
 
-    let result = unsafe { nix::libc::close_range(3, u32::MAX, 0) };
-    if result == -1 {
-        let error = io::Error::last_os_error();
-        return Err(io::Error::new(
-            error.kind(),
-            format!("failed to close fd: {error}"),
-        ));
-    }
+    fd::close_all_fd_but_std()?;
 
     signal::propagate_signals_to_child(cmd)
 }

@@ -31,6 +31,9 @@ pub(crate) enum Commands {
 
         #[arg(long, short, required = true)]
         rootfs: PathBuf,
+
+        #[arg(long, required = true)]
+        startup_fd: i32,
     },
 
     #[command(name = "__container", hide = true)]
@@ -40,5 +43,8 @@ pub(crate) enum Commands {
 
         #[arg(long, short, required = true)]
         rootfs: PathBuf,
+
+        #[arg(long, required = true)]
+        startup_fd: i32,
     },
 }

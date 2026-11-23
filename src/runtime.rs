@@ -4,8 +4,11 @@ mod signal;
 
 use nix::fcntl::OFlag;
 use nix::sched::{CloneFlags, unshare};
+use nix::unistd::Pid;
 use nix::unistd::{pipe2, sethostname};
-use std::os::fd::AsRawFd;
+use std::format;
+use std::io::Write;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::{fs, io, path::Path};
 use uuid::Uuid;
 
@@ -18,7 +21,7 @@ pub(crate) fn run(
     let executable = std::env::current_exe()?;
 
     let (startup_read, startup_write) = pipe2(OFlag::O_CLOEXEC).map_err(io::Error::other)?;
-    fd::close_cloexec(&startup_write)?;
+    fd::remove_fdcloexec(&startup_write)?;
 
     let mut cmd = std::process::Command::new(executable);
     cmd.arg("__bootstrap");
@@ -27,11 +30,21 @@ pub(crate) fn run(
     cmd.arg("--rootfs");
     cmd.arg(rootfs);
     cmd.arg("--startup-fd");
-    cmd.arg(format!("{}", startup_write.as_raw_fd()));
+    cmd.arg(startup_write.as_raw_fd().to_string());
     cmd.arg("--");
     cmd.args(command);
 
-    signal::propagate_signals_to_child(cmd)
+    let signal_fd = signal::setup_signal_fd(&mut cmd)?;
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| io::Error::new(e.kind(), format!("failed to spawn child process: {e}")))?;
+
+    let workload_pid = Pid::from_raw(child.id() as i32);
+
+    drop(startup_write);
+
+    signal::listen_signals(signal_fd, workload_pid)
 }
 
 pub(crate) fn bootstrap(
@@ -40,6 +53,22 @@ pub(crate) fn bootstrap(
     rootfs: &Path,
     startup_fd: i32,
 ) -> io::Result<i32> {
+    if startup_fd < 3 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "startup_fd must be >= 3",
+        ));
+    }
+
+    if unsafe { nix::libc::fcntl(startup_fd, nix::libc::F_GETFD) == -1 } {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "startup_fd is closed",
+        ));
+    }
+
+    let startup_fd = unsafe { OwnedFd::from_raw_fd(startup_fd) };
+
     let rootfs = fs::canonicalize(rootfs)
         .map_err(|e| io::Error::new(e.kind(), format!("failed to canonicalize: {e}")))?;
 
@@ -58,14 +87,38 @@ pub(crate) fn bootstrap(
     cmd.arg("--rootfs");
     cmd.arg(rootfs);
     cmd.arg("--startup-fd");
-    cmd.arg(format!("{}", startup_fd.as_raw_fd()));
+    cmd.arg(startup_fd.as_raw_fd().to_string());
     cmd.arg("--");
     cmd.args(command);
 
-    signal::propagate_signals_to_child(cmd)
+    let signal_fd = signal::setup_signal_fd(&mut cmd)?;
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| io::Error::new(e.kind(), format!("failed to spawn child process: {e}")))?;
+
+    drop(startup_fd);
+
+    let workload_pid = Pid::from_raw(child.id() as i32);
+
+    signal::listen_signals(signal_fd, workload_pid)
 }
 
 pub(crate) fn container(command: Vec<String>, rootfs: &Path, startup_fd: i32) -> io::Result<i32> {
+    if startup_fd < 3 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "startup_fd must be >= 3",
+        ));
+    }
+
+    if unsafe { nix::libc::fcntl(startup_fd, nix::libc::F_GETFD) == -1 } {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "startup_fd is closed",
+        ));
+    }
+
     let entrypoint = command.first().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -79,7 +132,41 @@ pub(crate) fn container(command: Vec<String>, rootfs: &Path, startup_fd: i32) ->
     rootfs::switch_root(rootfs)?;
     rootfs::mount_proc()?;
 
-    fd::close_all_fd_but_std()?;
+    if startup_fd > 3 {
+        let result = unsafe { nix::libc::close_range(3, (startup_fd - 1) as u32, 0) };
+        if result == -1 {
+            let error = io::Error::last_os_error();
+            return Err(io::Error::new(
+                error.kind(),
+                format!("failed to close fd: {error}"),
+            ));
+        };
+    }
 
-    signal::propagate_signals_to_child(cmd)
+    let result = unsafe { nix::libc::close_range((startup_fd + 1) as u32, u32::MAX, 0) };
+    if result == -1 {
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            format!("failed to close fd: {error}"),
+        ));
+    };
+
+    let startup_fd = unsafe { OwnedFd::from_raw_fd(startup_fd) };
+    fd::set_fdcloexec(&startup_fd)?;
+
+    let signal_fd = signal::setup_signal_fd(&mut cmd)?;
+    let child = cmd
+        .spawn()
+        .map_err(|e| io::Error::new(e.kind(), format!("failed to spawn child process: {e}")))?;
+
+    let mut startup_writer = std::fs::File::from(startup_fd);
+    if let Err(err) = startup_writer.write_all(b"S") {
+        eprintln!("failed to report container startup: {err}");
+    }
+    drop(startup_writer);
+
+    let workload_pid = Pid::from_raw(child.id() as i32);
+
+    signal::listen_signals(signal_fd, workload_pid)
 }

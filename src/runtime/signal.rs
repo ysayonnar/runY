@@ -6,7 +6,7 @@ use nix::unistd::Pid;
 use std::io;
 use std::os::unix::process::CommandExt;
 
-pub(super) fn propagate_signals_to_child(mut cmd: std::process::Command) -> io::Result<i32> {
+pub(super) fn setup_signal_fd(cmd: &mut std::process::Command) -> io::Result<SignalFd> {
     let original_mask = SigSet::thread_get_mask().map_err(io::Error::other)?;
     let mut mask = SigSet::empty();
     mask.add(Signal::SIGINT);
@@ -22,12 +22,10 @@ pub(super) fn propagate_signals_to_child(mut cmd: std::process::Command) -> io::
         cmd.pre_exec(move || original_mask.thread_set_mask().map_err(io::Error::other));
     }
 
-    let child = cmd
-        .spawn()
-        .map_err(|e| io::Error::new(e.kind(), format!("failed to spawn child process: {e}")))?;
+    Ok(signal_fd)
+}
 
-    let workload_pid = Pid::from_raw(child.id() as i32);
-
+pub(super) fn listen_signals(signal_fd: SignalFd, workload_pid: Pid) -> io::Result<i32> {
     loop {
         let siginfo = match signal_fd.read_signal() {
             Ok(Some(siginfo)) => siginfo,
